@@ -1,0 +1,10 @@
+# --------------------
+# Default Settings
+# --------------------
+
+QUARTUS_VERSION = "18.1"
+DATE = "13:00:02  January 18, 2020"
+
+# Revisions
+
+PROJECT_REVISION = "USB_DE0_NANO"

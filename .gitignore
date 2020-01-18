@@ -1,0 +1,11 @@
+.gitignore_files/
+db/
+incremental_db/
+output_files/
+simulation/
+*.qws
+modelsim_lib/*.v
+modelsim_lib/*.vhd
+.*.swp
+.*~
+*~
