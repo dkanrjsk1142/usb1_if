@@ -1,11 +1,27 @@
+#general ignore
 .gitignore_files/
+*.log
+
+#Quartus auto-generate
 db/
 incremental_db/
 output_files/
 simulation/
 *.qws
+
+#Modelsim Licensed RTL(library for simulation)
 modelsim_lib/*.v
 modelsim_lib/*.vhd
+
+#Modelsim auto-generate
+alib/
+work/
+modelsim.ini
+transcript
+*.vstf
+*.wlf
+
+#vim auto-generate
 .*.swp
 .*~
 *~

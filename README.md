@@ -3,6 +3,9 @@ usb1.x interface in de0-nano FPGA board.
 
 bus controller required.
 
+real device test is by uart_de0_nano project.  
+-> register setting & uart2usb flow testing
+
 this project is based on Intel Quartus Prime 18.1 lite Edition.(free edition)  
 (contain Modelsim - Intel FPGA Starter Edition 10.5b)
 
