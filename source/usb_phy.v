@@ -9,24 +9,18 @@
 //             SE1 : H    H  ***never occur. this is seen as an error
 // --------------------------------------------------------
 // Ver     Date       Author              Comment
-// 0.01    2020.01.18 I.Yang              Create New
+// 0.01    2020.01.xx I.Yang              Create New
 // --------------------------------------------------------
 
 `timescale 1ns / 1ps
 
 module usb_phy #(
-	parameter SYS_CLK_FREQ = 24000000, // 24MHz
-	parameter USB_VER_1_X  =        1, // 1:USB1.1 / 0:USB1.0
-	parameter SYNC_MODE      = 8, // 1: async(clk_enqueue_i - clk_dequeue_i is different clk) / 0: sync(same clk)
-	parameter BUF_ADDR_WIDTH = 8, // BUF_SIZE = 2^BUF_ADR_WIDTH
-	parameter DATA_BIT_WIDTH = 8, // 
-	parameter WAIT_DELAY     = 0  // wait reply delay(0:no wait reply from receive module)
+	parameter USB_VER_1_X  = 1  // 1:USB1.1 / 0:USB1.0
 ) (
-
 	input  wire                      rst_ni,
-	input  wire                      clk_i,
+	input  wire                      clk_i,        // 24MHz
 
-	// 
+	// for physical line
 	input  wire                      usb_rx_dp_i, // weak pull-down(not allowed usb spec)
 	input  wire                      usb_rx_dm_i, // weak pull-down(not allowed usb spec)
 
@@ -34,105 +28,83 @@ module usb_phy #(
 	output wire                      usb_tx_dm_o,
 	output wire                      usb_tx_oe_o,
 
-	output wire                      usb_dp_pull_up_en_o, // for emulate low/full speed
-	output wire                      usb_dm_pull_up_en_o, // for emulate low/full speed
+	output wire                      usb_dp_pull_up_en_o, // connect external pull-up resistor switch
+	output wire                      usb_dm_pull_up_en_o, // connect external pull-up resistor switch
 
 	input  wire                      usb_disconnect_i, // 1: set bus Hi-Z. 0: when reconnect, set J state after 2us SE0 state
 
-	// 
-	output wire                      sync_det_o,
+	// for internal RTL
+	output wire               [ 3:0] rx_state_o, // 0:idle,     F:UNKNOWN
 
-	output wire                      init_ok_o,
+	output wire                      rx_packet_st_o, // 1clk pulse after SYNC-detected
+	output wire                      rx_packet_ed_o, // 1clk pulse after EOP-detected
+	output wire               [ 1:0] rx_packet_type_o, // 0:SOF / 1:TOKEN / 2:DATA / 3:Hand-Shake
 
-	input  wire                      dequeue_wait_i,
-	output wire                      dequeue_den_o,
-	output wire [DATA_BIT_WIDTH-1:0] dequeue_data_o,
-	output wire                      is_queue_empty_o // loosy empty status(there is some delay after queue is empty)
+	output wire                      rx_data_o, // 
+	output wire                      rx_den_o,  // 
+
+	output wire                      rx_pid_error_o, // 1clk pulse after (pid(MSB4bit) != ~pid(LSB4bit))
+	output wire                      rx_crc_error_o, // 1clk pulse
+
+
+	input  wire                      tx_request_i, // 1clk pulse when idle state. keep TX(line status) until EOP.
+
+
+	output wire                      rx_crc_error_o  // 1clk pulse
 );
 
 
 localparam [3:0]  USB_CLK_EN_CNTR = (USB_VER_1_X == 1) ? 4'h1, 4'hF;
 
-localparam [1:0]  SE0_STATE     = 2'b00;
-localparam [1:0]  J_STATE       = (USB_VER_1_X == 1) ? 2'b10 : 2'b01;
-localparam [1:0]  K_STATE       = (USB_VER_1_X == 1) ? 2'b01 : 2'b10;
-localparam [1:0]  SE1_STATE     = 2'b11;
+localparam [1:0]  SE0_STATE      = 2'b00;
+localparam [1:0]  J_STATE        = (USB_VER_1_X == 1) ? 2'b10 : 2'b01;
+localparam [1:0]  K_STATE        = (USB_VER_1_X == 1) ? 2'b01 : 2'b10;
+localparam [1:0]  SE1_STATE      = 2'b11;
 
+localparam [3:0]  FSM_IDLE       = 4'h0; // SE0 >= 2us
+localparam [3:0]  FSM_SYNC       = 4'h1; // check KJKJKJKK (with wdt, goto UNKNOWN after timeout)
+localparam [3:0]  FSM_PID        = 4'h2; // check PID(goto UNKNOWN if 0000 or (MSB4bit == ~LSB4bit))
+localparam [3:0]  FSM_PAYLOAD    = 4'h3; // SE0 + SE0 + J
+localparam [3:0]  FSM_CRC        = 4'h4; // SE0 + SE0 + J
+localparam [3:0]  FSM_EOP        = 4'h5; // SE0 + SE0 + J
+localparam [3:0]  FSM_RESET      = 4'h3; // SE0 >= 2.5ms
+localparam [3:0]  FSM_SUSPEND    = 4'h4; // J >= 3ms -- not use??
+localparam [3:0]  FSM_RESUME_HST = 4'h5; // K >= 20ms then EOP pattern
+localparam [3:0]  FSM_RESUME_DEV = 4'h6; // after idle > 5ms, K >= 1ms(host replay FSM_RESUME_HST)
+localparam [3:0]  FSM_UNKNOWN    = 4'hF; // goto IDLE(which condition?)
+
+localparam [1:0]  PACKET_SOF     = 2'h0;
+localparam [1:0]  PACKET_TOKEN   = 2'h1;
+localparam [1:0]  PACKET_DATA    = 2'h2;
+localparam [1:0]  PACKET_HNDSHK  = 2'h3;
+// PACKET_SPLIT(USB2.0 only) is T.B.D.(when support USB2.0)
+
+ 
 localparam [CNT_BITWIDTH-1:0] p_num_clk_cntr_max  = (SYS_CLK_FREQ / BAUD_RATE) - 1;
 localparam [CNT_BITWIDTH-1:0] p_num_clk_cntr_half = (SYS_CLK_FREQ / BAUD_RATE) / 2;
 
-reg         s_clk_en;
-reg  [ 3:0] s_clk_en_cntr;
+localparam P_RX_CLK_EN_CNTR_WIDTH = (USB_VER_1_X == 1) ? 1 : 4;
+
+reg         s_rx_clk_en;
+reg  [P_RX_CLK_EN_CNTR_WIDTH-1:0] s_rx_clk_en_cntr;
 
 reg  [ 1:0] s_usb_rx_dp_d;
 reg  [ 1:0] s_usb_rx_dm_d;
 reg  [ 1:0] s_rx_data; // 0:SE0, 1:J, 2:K, 3:SE1
+wire        s_rx_chg_det;
 
-reg  [CNT_BITWIDTH-1:0] s_rx_bit_cntr;
-reg  [ 3:0] s_rx_word_cntr;
-wire        s_rx_fetch_tmg;
-reg  [ 7:0] s_rx_data;
 
-reg        s_rx_irq;
-reg  [7:0] s_rx_data_1d;
-
-reg  [ 1:0] s_tx_irq_d;
-reg  [ 7:0] s_tx_data;
-reg  [ 7:0] s_tx_data_1d;
-reg         s_tx_en;
-reg  [CNT_BITWIDTH-1:0] s_tx_bit_cntr;
-reg  [ 3:0] s_tx_word_cntr;
-wire        s_tx_fetch_tmg;
-
-// --------------------
-// function
-// --------------------
-// Binary2Graycode converter
-function [BUF_ADDR_WIDTH-1:0] bin2gray(input [BUF_ADDR_WIDTH-1:0] binary);
-	bin2gray = binary ^ (binary >> 1);
-endfunction
-// --------------------
-
-// wr address
-always @(negedge rst_ni, posedge clk_enqueue_i)
-begin
-	if(~rst_ni)
-		s_enqueue_addr <= {{BUF_ADDR_WIDTH{1'b0}}, 1'b1}; // for make graycode
-	else if(clk_enqueue_i) begin
-		if (s_enqueue_den_1d)
-			s_enqueue_addr <= s_enqueue_addr + 1'b1;
-	end
-end
-
-// --------------------
-// CLK EN
-// Low Speed  : 1/16 @ 24MHz
-// Full Speed :  1/2 @ 24MHz
-// --------------------
-always @(negedge rst_ni, posedge clk_i)
-begin
-	if(~rst_ni)
-		s_clk_en_cntr <= 4'b0;
-	else if(clk_enqueue_i) begin
-		if (s_rx_chg_det) // clk recovery
-			s_clk_en_cntr <= 4'b0;
-		else
-			s_clk_en_cntr <= s_clk_en_cntr + 1'b1;
-	end
-end
+reg  [2*6-1:0] s_s_rx_symbol_window;
+wire           s_sync_det;
+wire           s_eop_det;
 
 
 // --------------------
-// NRZ-I
+// BUS control
 // --------------------
+assign usb_tx_oe_o = s_tx_en;
 
-
-
-// --------------------
-// remove bit-stuff
-// --------------------
-
-// control external pull-up register
+// External(out of FPGA) resistor switch
 generate if (USB_VER_1_X == 1) begin
 	assign usb_dp_pull_up_en_o = 1'b1;
 	assign usb_dm_pull_up_en_o = 1'b0;
@@ -141,130 +113,275 @@ end else
 	assign usb_dm_pull_up_en_o = 1'b1;
 end
 
-// not need bit-stuffing for
-// PID***************************************************************************************
 
 // --------------------
-// rx
+// RX - FSM
 // --------------------
 // --------------------
-// rx
+// FSM
 // --------------------
-//
-//                   D+   D-
-//               J : L    H  (Low Speed) (Full Speed is inverse) idle line state
-//               K : H    L  (Low Speed) (Full Speed is inverse) inverse of J
-//             SE0 : L    L
-//             SE1 : H    H  ***never occur. this is seen as an error
+// CLK EN
+assign s_rx_clk_en = (s_rx_clk_en_cntr == {P_RX_CLK_EN_CNTR_WIDTH{1'b0}}) ? 1'b1 : 1'b0;
 
+// CLK EN counter
+// Low Speed  : 1/16 @ 24MHz
+// Full Speed :  1/2 @ 24MHz
+always @(negedge rst_ni, posedge clk_i)
+begin
+	if(~rst_ni)
+		s_rx_clk_en_cntr <= {P_RX_CLK_EN_CNTR_WIDTH{1'b0};
+	else if(clk_i) begin
+		if (s_rx_chg_det) // clk recovery
+			s_rx_clk_en_cntr <= {P_RX_CLK_EN_CNTR_WIDTH{1'b0};
+		else
+			s_rx_clk_en_cntr <= s_rx_clk_en_cntr + 1'b1;
+	end
+end
+
+assign s_crlf  = wr_data_i == 8'h0A || wr_data_i == 8'h0D ? 1'b1 : 1'b0;
+assign s_space = wr_data_i == 8'h20  ? 1'b1 : 1'b0;
+
+localparam [3:0]  FSM_IDLE       = 4'h0; // SE0 >= 2us
+localparam [3:0]  FSM_SYNC       = 4'h1; // check KJKJKJKK (with wdt, goto UNKNOWN after timeout)
+localparam [3:0]  FSM_PID        = 4'h2; // check PID(goto UNKNOWN if 0000 or (MSB4bit == ~LSB4bit))
+localparam [3:0]  FSM_PAYLOAD    = 4'h3; // SE0 + SE0 + J
+localparam [3:0]  FSM_CRC        = 4'h4; // SE0 + SE0 + J
+localparam [3:0]  FSM_EOP        = 4'h5; // SE0 + SE0 + J
+
+assign s_sync_det = (s_s_rx_symbol_window == {3{K_STATE, J_STATE}, K_STATE, K_STATE}) ? 1'b1 : 1'b0;
+assign s_eop_det  = (s_s_rx_symbol_window[3*2-1:0] == {SE0_STATE, SE0_STATE, J_STATE}) ? 1'b1 : 1'b0;
+
+always @(negedge rst_ni, posedge clk_i)
+begin
+	if(~rst_ni)
+		s_next_state <= FSM_IDLE;
+	else if(clk_i) begin
+		if (wr_en_i) begin
+			case (s_state)
+				FSM_IDLE:
+					begin
+						s_state_wdt_cntr_en  <= 1'h0;
+						//s_state_wdt_cntr_max <= 4'h7;
+						if ( s_rx_chg_det)
+							s_next_state <= FSM_SYNC;
+						else if(s_state_wdt_cntr == s_state_wdt_max)
+							s_next_state <= FSM_UNKNOWN;
+						else
+							s_next_state <= s_state;
+					end
+				FSM_SYNC:
+					begin
+						s_state_wdt_cntr_en  <= 1'h1;
+						s_state_wdt_cntr_max <= 4'h7;
+						if (s_sync_det)
+							s_next_state <= FSM_PID;
+						else if(s_state_wdt_cntr == s_state_wdt_max)
+							s_next_state <= FSM_UNKNOWN;
+						else
+							s_next_state <= s_state;
+					end
+				FSM_PID:
+					begin
+						s_state_wdt_cntr_en  <= 1'h1;
+						s_state_wdt_cntr_max <= 4'h7;
+						if (s_pid_error)
+							s_next_state <= FSM_UNKNOWN;
+						else if (s_pid_det) begin
+							case(s_packet_type)
+								PACKET_SOF    : s_next_state <= FSM_PAYLOAD_CRC5;
+								PACKET_TOKEN  : s_next_state <= FSM_PAYLOAD_CRC5;
+								PACKET_DATA   : s_next_state <= FSM_PAYLOAD_CRC16;
+								PACKET_HNDSHK : s_next_state <= FSM_EOP;
+								// PACKET_SPLIT(USB2.0 only) is T.B.D.(when support USB2.0)
+								default       : s_next_state <= FSM_UNKNOWN;
+							endcase
+						else if(s_state_wdt_cntr == s_state_wdt_max)
+							s_next_state <= FSM_UNKNOWN;
+						else
+							s_next_state <= s_state;
+					end
+				FSM_DATA_PAYLOAD:
+					begin
+						s_state_wdt_cntr_en  <= 1'h0;
+						s_state_wdt_cntr_max <= 4'h7;
+						if (s_crlf) begin
+							if (s_rgn_cmd == CMD_RAW)
+								s_next_state <= FSM_RAW_DATA_RECEIVE;
+							else
+								s_next_state <= FSM_IDLE;
+						end
+						else
+							s_next_state <= s_state;
+					end
+				FSM_RAW_DATA_RECEIVE:
+					if (s_rgn_cmd == CMD_RAW_END)
+						s_next_state <= FSM_IDLE;
+					else
+						s_next_state <= s_state;
+				default:
+					s_next_state <= FSM_IDLE;
+			endcase
+		end
+	end
+end
+
+always @(negedge rst_ni, posedge clk_i)
+begin
+	if(~rst_ni)
+		s_state <= FSM_IDLE;
+	else if(clk_i)
+		s_state <= s_next_state;
+end
+
+
+// --------------------
+// RX - generate CLK EN(Data EN)
+// --------------------
+// CLK EN
+assign s_rx_clk_en = (s_rx_clk_en_cntr == {P_RX_CLK_EN_CNTR_WIDTH{1'b0}}) ? 1'b1 : 1'b0;
+
+// CLK EN counter
+// Low Speed  : 1/16 @ 24MHz
+// Full Speed :  1/2 @ 24MHz
+always @(negedge rst_ni, posedge clk_i)
+begin
+	if(~rst_ni)
+		s_rx_clk_en_cntr <= {P_RX_CLK_EN_CNTR_WIDTH{1'b0};
+	else if(clk_i) begin
+		if (s_rx_chg_det) // clk recovery
+			s_rx_clk_en_cntr <= {P_RX_CLK_EN_CNTR_WIDTH{1'b0};
+		else
+			s_rx_clk_en_cntr <= s_rx_clk_en_cntr + 1'b1;
+	end
+end
+
+// --------------------
+// RX - receive data
+// --------------------
 // rx data shift register
 always @(negedge rst_ni, posedge clk_i)
 begin
     if(~rst_ni) begin
-		s_usb_rx_dp_d <= 2'b0;
-		s_usb_rx_dm_d <= 2'b0;
-		s_rx_chg_det  <= 1'b0;
+		s_usb_rx_dp_d <= {2{J_STATE[1]}};
+		s_usb_rx_dm_d <= {2{J_STATE[0]}};
     end else if(clk_i) begin
 		s_usb_rx_dp_d <= {s_usb_rx_dp_d[0], usb_rx_dp_i};
 		s_usb_rx_dm_d <= {s_usb_rx_dm_d[0], usb_rx_dm_i};
-
-		if (^s_usb_rx_dp_d | ^s_usb_rx_dm_d) // something change detected
-			s_rx_chg_det <= 1'b1;
-		else
-			s_rx_chg_det <= 1'b0;
     end
 end
+
+// something change detected
+assign s_rx_chg_det = (^s_usb_rx_dp_d | ^s_usb_rx_dm_d) ? 1'b1 : 1'b0;
+
 
 // received data
 // 0:SE0, 1:J, 2:K, 3:SE1
 always @(negedge rst_ni, posedge clk_i)
 begin
 	if(~rst_ni)
-		s_rx_data <= 2'b0;
+		s_rx_data <= J_STATE;
 	else if(clk_i) begin
-		if(s_clk_en)
+		if(s_rx_clk_en)
 			s_rx_data <= {s_usb_rx_dp_d[1], s_usb_rx_dm_d[1]};
 	end
 end
 
-// receive state(by start bit)
+// synbol Window
+// SYNC : ignore MSB 2bit. because of synchronization loss.
+// EOP  : full decode
 always @(negedge rst_ni, posedge clk_i)
 begin
 	if(~rst_ni)
-		s_rx_en  <= 1'b0;
+		s_s_rx_symbol_window <= {8{J_STATE}};
 	else if(clk_i) begin
-		if (s_rx_word_cntr == 4'd9 && s_rx_fetch_tmg) // not parity
-			s_rx_en  <= 1'b0;
-		else if (s_uart_rx_d == 2'b10) // negedge
-			s_rx_en  <= 1'b1;
+		if(s_rx_clk_en)
+			s_s_rx_symbol_window <= {s_s_rx_symbol_window, s_rx_data};
 	end
 end
 
-// bit counter
+assign s_sync_det = (s_s_rx_symbol_window == {3{K_STATE, J_STATE}, K_STATE, K_STATE}) ? 1'b1 : 1'b0;
+assign s_eop_det  = (s_s_rx_symbol_window[3*2-1:0] == {SE0_STATE, SE0_STATE, J_STATE}) ? 1'b1 : 1'b0;
+
+// need delay???
+always @(negedge rst_ni, posedge clk_i)
+begin
+	if(~rst_ni) begin
+		s_sync_det_1d <= 1'b0;
+		s_eop_det_1d  <= 1'b0;
+	end else if(clk_i) begin
+		if(s_rx_clk_en) begin
+			s_sync_det_1d <= s_sync_det;
+			s_eop_det_1d  <= s_eop_det;
+		end
+	end
+end
+
+assign rx_packet_st_o = s_sync_det_1d;
+assign rx_packet_ed_o = s_eop_det_1d;
+
+// --------------------
+// RX - decode NRZ-I & remove bit-stuff
+// --------------------
+// bit windows for decode NRZ-I(6bits) / CRC-5/16 and EOP(20bits)
 always @(negedge rst_ni, posedge clk_i)
 begin
 	if(~rst_ni)
-		s_rx_bit_cntr <= {CNT_BITWIDTH{1'b0}};
+		s_rx_bit_window <= 20'b0;
 	else if(clk_i) begin
-		if (~s_rx_en || s_rx_bit_cntr == p_num_clk_cntr_max)
-			s_rx_bit_cntr <= {CNT_BITWIDTH{1'b0}};
-		else
-			//s_rx_bit_cntr <= s_rx_bit_cntr + {{CNT_BITWIDTH-1{1'b0}}, 1'b1};
-			s_rx_bit_cntr <= s_rx_bit_cntr + 1'b1;
+		if(s_rx_clk_en) begin
+			if(s_rx_data == J_STATE)
+				s_rx_bit_window <= {s_rx_bit_window[19:0], 1'b1};
+			else if(s_rx_data == K_STATE)
+				s_rx_bit_window <= {s_rx_bit_window[19:0], 1'b0};
+		end
 	end
 end
 
-assign s_rx_fetch_tmg = s_rx_bit_cntr == p_num_clk_cntr_half ? 1'b1 : 1'b0;
-
-// word counter
+// bit data valid
+// 1:valid / 0:invalid(bit-stuffed bit)
 always @(negedge rst_ni, posedge clk_i)
 begin
 	if(~rst_ni)
-		s_rx_word_cntr  <= 4'b0;
+		s_rx_bit_stuff_den <= 1'b1;
 	else if(clk_i) begin
-		if (~s_rx_en)
-			s_rx_word_cntr  <= 4'b0;
-		else if(s_rx_fetch_tmg)
-				s_rx_word_cntr  <= s_rx_word_cntr + 4'b1;
+		if(s_rx_clk_en) begin
+			if(s_rx_bit_window[5:0] == {6{1'b1}})
+				s_rx_bit_stuff_den <= 1'b0;
+			else
+				s_rx_bit_stuff_den <= 1'b1;
+		end
 	end
 end
 
-// convert s/p
+assign rx_data_o = s_rx_bit_window[0];
+assign rx_den_o  = s_rx_clk_en & s_rx_bit_stuff_den;
+
+// --------------------
+// RX - Error check
+// --------------------
+// check PID not same
+
+	output wire                      rx_pid_error_o, // 1clk pulse after (pid(MSB4bit) != ~pid(LSB4bit))
+
 always @(negedge rst_ni, posedge clk_i)
 begin
 	if(~rst_ni)
-		s_rx_data <= 8'hFF;
+		s_rx_bit_stuff_den <= 1'b1;
 	else if(clk_i) begin
-		if (s_rx_fetch_tmg && s_rx_word_cntr != 4'd9)
-			s_rx_data <= {s_uart_rx_d[1], s_rx_data[7:1]};
+		if(s_rx_clk_en) begin
+			if(s_rx_bit_window == {6{1'b1}})
+				s_rx_bit_stuff_den <= 1'b0;
+			else
+				s_rx_bit_stuff_den <= 1'b1;
+		end
 	end
 end
 
-// rx complete irq
-always @(negedge rst_ni, posedge clk_i)
-begin
-	if(~rst_ni)
-		s_rx_irq  <= 1'b0;
-	//if(clk_i) begin -- mod Ver0.05
-	else if(clk_i) begin
-		if (s_rx_word_cntr == 4'd9 && s_rx_fetch_tmg)
-			s_rx_irq <= 1'b1;
-		else
-			s_rx_irq <= 1'b0;
-	end
-end
 
-// rx data latch
-always @(negedge rst_ni, posedge clk_i)
-begin
-	if(~rst_ni)
-		s_rx_data_1d <= 8'b0;
-	//if(clk_i) begin -- mod Ver0.05
-	else if(clk_i) begin
-		if (s_rx_word_cntr == 4'd9 && s_rx_fetch_tmg)
-			s_rx_data_1d <= s_rx_data; // latch
-	end
-end
+// RX - CRC cheker
+
+
+
 
 assign rx_irq_o  = s_rx_irq;
 assign rx_data_o = s_rx_data_1d;
@@ -272,80 +389,37 @@ assign rx_data_o = s_rx_data_1d;
 // --------------------
 // TX
 // --------------------
+// tx enable
+always @(negedge rst_ni, posedge clk_i)
+begin
+    if(~rst_ni)
+		s_tx_request <= 1'b0;
+    else if(clk_i) begin
+		if (tx_request_i)
+			s_tx_request <= 1'b1;
+		else if(s_eop_det)
+			s_tx_request <= 1'b0;
+    end
+end
 
 always @(negedge rst_ni, posedge clk_i)
 begin
-	if(~rst_ni) begin
-		s_tx_irq_d   <= 2'b0;
-		s_tx_data    <= 8'b0;
-		s_tx_data_1d <= 8'b0;
-	end else if(clk_i) begin
-		s_tx_irq_d <= {s_tx_irq_d[0], tx_irq_i};
-		s_tx_data  <= tx_data_i;
-		if (s_tx_irq_d == 2'b01) // posedge
-			s_tx_data_1d <= s_tx_data;
-	end
+    if(~rst_ni) begin
+		s_tx_request_en <= 1'b0;
+    end else if(clk_i) begin
+		if (s_state == FSM_IDLE)
+			s_tx_en <= s_tx_request;
+		else if(s_eop_det)
+			s_tx_en <= 1'b0;
+    end
 end
 
-// transmit state(by start bit)
-always @(negedge rst_ni, posedge clk_i)
-begin
-	if(~rst_ni)
-		s_tx_en  <= 1'b0;
-	else if(clk_i) begin
-		//if (s_tx_word_cntr == 4'd10 && s_tx_fetch_tmg) // not parity -- mod Ver0.04
-		if (s_tx_word_cntr == 4'd9 && s_tx_fetch_tmg) // not parity
-			s_tx_en  <= 1'b0;
-		else if (s_tx_irq_d == 2'b01) // posedge
-			s_tx_en  <= 1'b1;
-	end
-end
 
-// bit counter
-always @(negedge rst_ni, posedge clk_i)
-begin
-	if(~rst_ni)
-		s_tx_bit_cntr <= {CNT_BITWIDTH{1'b0}};
-	else if(clk_i) begin
-		if (~s_tx_en || s_tx_bit_cntr == p_num_clk_cntr_max)
-			s_tx_bit_cntr <= {CNT_BITWIDTH{1'b0}};
-		else
-			//s_tx_bit_cntr <= s_tx_bit_cntr + {{(CNT_BITWIDTH-1){1'b0}}, 1'b1};
-			s_tx_bit_cntr <= s_tx_bit_cntr + 1'b1;
-	end
-end
 
-assign s_tx_fetch_tmg = s_tx_bit_cntr == p_num_clk_cntr_max ? 1'b1 : 1'b0; // not delay but !=0
 
-// word counter
-always @(negedge rst_ni, posedge clk_i)
-begin
-	if(~rst_ni)
-		s_tx_word_cntr  <= 4'b0;
-	else if(clk_i) begin
-		if (~s_tx_en)
-			s_tx_word_cntr  <= 4'b0;
-		else if(s_tx_fetch_tmg)
-				s_tx_word_cntr  <= s_tx_word_cntr + 4'b1;
-	end
-end
 
-// convert p/s
-always @(negedge rst_ni, posedge clk_i)
-begin
-	if(~rst_ni)
-		uart_tx_o <= 1'b1;
-	else if(clk_i) begin
-		case (s_tx_word_cntr)
-			4'h1 : uart_tx_o <= 1'b0; // start bit
-			4'h2 , 4'h3 , 4'h4 , 4'h5 , 
-			4'h6 , 4'h7 , 4'h8 , 4'h9 : 
-				   uart_tx_o <= s_tx_data_1d[s_tx_word_cntr-2];
-			4'hA : uart_tx_o <= 1'b1; // stop bit
-			default : uart_tx_o <= 1'b1;
-		endcase
-	end
-end
+
+
 
 assign tx_busy_o = s_tx_en;
 
