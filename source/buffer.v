@@ -32,6 +32,7 @@
 //                                        -> select by parameter
 //                                        -> manage by gray code
 //                                        add status(empty/full) pin
+// 0.07    2020.02.01 I.Yang              support negative value WAIT_DELAY
 //
 // --------------------------------------------------------
 
@@ -73,7 +74,7 @@ reg  [BUF_ADDR_WIDTH-1:0] s_enqueue_addr;
 reg  [BUF_ADDR_WIDTH-1:0] s_dequeue_addr;
 
 reg  [BUF_ADDR_WIDTH-1:0] s_dequeue_addr_before_wait;
-wire [BUF_ADDR_WIDTH-1:0] s_dequeue_addr_diff;
+wire signed [BUF_ADDR_WIDTH  :0] s_dequeue_addr_diff; // signed arith with WAIT_DELAY
 
 reg                       s_dequeue_wait_1d;
 
@@ -279,7 +280,7 @@ begin
 	else if(clk_dequeue_i) begin
 		if (s_dequeue_den & ~s_dequeue_den_1d) // posedge
 			s_dequeue_addr_before_wait <= s_dequeue_addr + 1'b1;
-		else if (s_dequeue_addr_diff >= WAIT_DELAY[BUF_ADDR_WIDTH-1:0])
+		else if ($signed(s_dequeue_addr_diff) >= $signed(WAIT_DELAY[BUF_ADDR_WIDTH:0]))
 			s_dequeue_addr_before_wait <= s_dequeue_addr - WAIT_DELAY[BUF_ADDR_WIDTH-1:0];
 	end
 end
